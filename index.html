@@ -1,0 +1,814 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#05070a">
+<title>Grainfield XR</title>
+<style>
+  :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  * { box-sizing: border-box; }
+  html, body { width:100%; height:100%; margin:0; overflow:hidden; background:#05070a; color:#eef2f5; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+  #ui {
+    position:fixed; left:18px; top:18px; z-index:5; width:min(390px,calc(100vw - 36px));
+    padding:14px 14px 12px; border:1px solid rgba(255,255,255,.10); border-radius:12px;
+    background:rgba(6,9,13,.56); backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
+    box-shadow:0 14px 45px rgba(0,0,0,.28); transition:opacity .25s ease;
+  }
+  #ui.quiet { opacity:.16; }
+  #ui:hover, #ui:focus-within { opacity:1; }
+  .top { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  h1 { font-size:13px; margin:0; font-weight:650; letter-spacing:.12em; text-transform:uppercase; }
+  #status { margin-top:8px; font-size:12px; line-height:1.45; color:#aeb8c4; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  button {
+    appearance:none; border:1px solid rgba(255,255,255,.14); border-radius:8px; color:#eef2f5;
+    background:rgba(255,255,255,.06); padding:8px 10px; font:600 11px/1 system-ui; letter-spacing:.04em;
+    cursor:pointer; min-height:34px;
+  }
+  button:hover { background:rgba(255,255,255,.11); }
+  button:disabled { opacity:.35; cursor:default; }
+  .primary { background:rgba(255,255,255,.90); color:#0b0e12; border-color:transparent; }
+  .primary:hover { background:#fff; }
+  .hint { margin-top:10px; font-size:10px; line-height:1.45; color:#768290; }
+  .dot { width:7px; height:7px; border-radius:50%; background:#d4b27a; box-shadow:0 0 18px #d4b27a; flex:none; }
+  #readout { display:flex; align-items:center; gap:8px; font-size:10px; color:#87919d; }
+  @media (max-width:600px) {
+    #ui { left:12px; top:12px; width:calc(100vw - 24px); padding:12px; }
+    .hint { display:none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="ui">
+  <div class="top">
+    <h1>Grainfield XR</h1>
+    <div id="readout"><span class="dot"></span><span id="fps">—</span></div>
+  </div>
+  <div id="status">Initializing WebGL2 and checking WebXR…</div>
+  <div class="row">
+    <button id="vr" class="primary" disabled>Enter VR</button>
+    <button id="motion" hidden>Enable motion</button>
+    <button id="fullscreen">Fullscreen</button>
+    <button id="reset">Reset field</button>
+  </div>
+  <div class="hint">
+    VR: move your head and sweep either controller/hand through the grains. Trigger attracts; squeeze repels.
+    Thumbsticks bias the current. Desktop/mobile: drag or tilt the device; press/hold to pull the grains.
+  </div>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+const canvas = document.getElementById('gl');
+const statusEl = document.getElementById('status');
+const vrBtn = document.getElementById('vr');
+const motionBtn = document.getElementById('motion');
+const fsBtn = document.getElementById('fullscreen');
+const resetBtn = document.getElementById('reset');
+const fpsEl = document.getElementById('fps');
+const ui = document.getElementById('ui');
+
+const gl = canvas.getContext('webgl2', {
+  alpha:false, antialias:true, depth:true, stencil:false,
+  premultipliedAlpha:false, preserveDrawingBuffer:false,
+  xrCompatible:true
+});
+if (!gl) {
+  statusEl.textContent = 'WebGL2 is required.';
+  throw new Error('WebGL2 unavailable');
+}
+
+const isMobile = matchMedia('(pointer:coarse)').matches;
+let xrSupported = false;
+let xrSession = null;
+let xrRefSpace = null;
+let xrLayer = null;
+let xrFirstPose = true;
+let desktopRAF = 0;
+
+let lastTime = performance.now();
+let fpsClock = lastTime;
+let fpsFrames = 0;
+let yaw = 0;
+let pitch = -0.02;
+let pointerDown = false;
+let pointerX = 0;
+let pointerY = 0;
+let lastPointerX = 0;
+let lastPointerY = 0;
+let motionEnabled = false;
+let deviceAlpha = 0, deviceBeta = 0, deviceGamma = 0;
+let fieldBiasX = 0, fieldBiasZ = 0;
+
+const head = {
+  pos: new Float32Array([0, 1.55, 0]),
+  prevPos: new Float32Array([0, 1.55, 0]),
+  vel: new Float32Array(3),
+  q: new Float32Array([0,0,0,1]),
+  forward: new Float32Array([0,0,-1]),
+  right: new Float32Array([1,0,0]),
+  up: new Float32Array([0,1,0])
+};
+
+const hands = [
+  makeHand('left', -1),
+  makeHand('right', 1)
+];
+function makeHand(name, sign) {
+  return {
+    name, sign, active:false,
+    pos:new Float32Array([sign*.5,1.25,-.8]),
+    prevPos:new Float32Array([sign*.5,1.25,-.8]),
+    vel:new Float32Array(3),
+    trigger:0, squeeze:0
+  };
+}
+
+const center = new Float32Array([0,1.35,0]);
+let particleCount = isMobile ? 7600 : 11800;
+const positions = new Float32Array(particleCount * 3);
+const velocities = new Float32Array(particleCount * 3);
+const seeds = new Float32Array(particleCount);
+const targetR = new Float32Array(particleCount);
+
+const tmpA = new Float32Array(3);
+const tmpB = new Float32Array(3);
+const tmpC = new Float32Array(3);
+const mView = new Float32Array(16);
+const mProj = new Float32Array(16);
+const mVP = new Float32Array(16);
+
+function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+function len3(x,y,z){ return Math.hypot(x,y,z); }
+function normalize3(out,x,y,z){
+  const l = Math.hypot(x,y,z) || 1;
+  out[0]=x/l; out[1]=y/l; out[2]=z/l; return out;
+}
+function cross3(out, ax,ay,az, bx,by,bz){
+  out[0]=ay*bz-az*by; out[1]=az*bx-ax*bz; out[2]=ax*by-ay*bx; return out;
+}
+function quatRotate(out, q, x,y,z) {
+  const qx=q[0], qy=q[1], qz=q[2], qw=q[3];
+  const ix = qw*x + qy*z - qz*y;
+  const iy = qw*y + qz*x - qx*z;
+  const iz = qw*z + qx*y - qy*x;
+  const iw = -qx*x - qy*y - qz*z;
+  out[0] = ix*qw + iw*-qx + iy*-qz - iz*-qy;
+  out[1] = iy*qw + iw*-qy + iz*-qx - ix*-qz;
+  out[2] = iz*qw + iw*-qz + ix*-qy - iy*-qx;
+  return out;
+}
+function mat4Multiply(out,a,b){
+  const o = new Float32Array(16);
+  for(let c=0;c<4;c++) for(let r=0;r<4;r++) {
+    o[c*4+r] =
+      a[0*4+r]*b[c*4+0] +
+      a[1*4+r]*b[c*4+1] +
+      a[2*4+r]*b[c*4+2] +
+      a[3*4+r]*b[c*4+3];
+  }
+  out.set(o); return out;
+}
+function perspective(out, fovy, aspect, near, far){
+  const f=1/Math.tan(fovy/2);
+  out.fill(0);
+  out[0]=f/aspect; out[5]=f; out[11]=-1;
+  out[10]=(far+near)/(near-far);
+  out[14]=(2*far*near)/(near-far);
+  return out;
+}
+function lookAt(out, eye, target, up){
+  let zx=eye[0]-target[0], zy=eye[1]-target[1], zz=eye[2]-target[2];
+  let l=Math.hypot(zx,zy,zz)||1; zx/=l; zy/=l; zz/=l;
+  let xx=up[1]*zz-up[2]*zy, xy=up[2]*zx-up[0]*zz, xz=up[0]*zy-up[1]*zx;
+  l=Math.hypot(xx,xy,xz)||1; xx/=l; xy/=l; xz/=l;
+  const yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+  out[0]=xx; out[1]=yx; out[2]=zx; out[3]=0;
+  out[4]=xy; out[5]=yy; out[6]=zy; out[7]=0;
+  out[8]=xz; out[9]=yz; out[10]=zz; out[11]=0;
+  out[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+  out[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+  out[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+  out[15]=1;
+  return out;
+}
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(sh) || 'shader compile failed');
+  }
+  return sh;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(p) || 'program link failed');
+  }
+  return p;
+}
+
+const particleProgram = program(`#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in float aSeed;
+uniform mat4 uVP;
+uniform float uPixelRatio;
+uniform float uTime;
+out float vSeed;
+out float vDepth;
+void main(){
+  vec4 clip = uVP * vec4(aPos,1.0);
+  gl_Position = clip;
+  float nd = max(0.18, abs(clip.w));
+  gl_PointSize = clamp(uPixelRatio * (9.0 / nd), 1.3, 8.5);
+  vSeed = aSeed;
+  vDepth = nd;
+}`, `#version 300 es
+precision highp float;
+in float vSeed;
+in float vDepth;
+uniform float uTime;
+out vec4 frag;
+void main(){
+  vec2 p = gl_PointCoord * 2.0 - 1.0;
+  float a = vSeed * 6.2831853;
+  mat2 r = mat2(cos(a),-sin(a),sin(a),cos(a));
+  p = r*p;
+  p = vec2(p.x*0.56, p.y*1.33);
+  float d = dot(p,p);
+  if(d>1.0) discard;
+  float edge = smoothstep(1.0,0.18,d);
+  float core = pow(max(0.0,1.0-d),2.6);
+  float tw = 0.78 + 0.22*sin(uTime*2.1 + vSeed*31.0);
+  vec3 amber = vec3(0.87,0.67,0.38);
+  vec3 ivory = vec3(1.0,0.94,0.77);
+  vec3 col = mix(amber,ivory,0.35 + 0.55*fract(vSeed*8.7));
+  frag = vec4(col * (0.35 + 1.35*core) * tw, edge * (0.32 + 0.55*core));
+}`);
+
+const beamProgram = program(`#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in float aBeam;
+uniform mat4 uVP;
+uniform vec3 uCenter;
+uniform float uTime;
+out float vY;
+out float vBeam;
+out vec3 vWorld;
+void main(){
+  vec3 wobble = vec3(sin(uTime*.17+aBeam*3.1),0.0,cos(uTime*.13+aBeam*2.7))*0.13;
+  vec3 world = aPos + uCenter + wobble;
+  vWorld = world;
+  vY = aPos.y;
+  vBeam = aBeam;
+  gl_Position = uVP * vec4(world,1.0);
+}`, `#version 300 es
+precision highp float;
+in float vY;
+in float vBeam;
+in vec3 vWorld;
+uniform float uTime;
+out vec4 frag;
+float hash(vec3 p){ return fract(sin(dot(p,vec3(12.9898,78.233,37.719)))*43758.5453); }
+void main(){
+  float n = hash(floor(vWorld*4.0 + vec3(0.0,uTime*.2,0.0)));
+  float longitudinal = smoothstep(-1.6,-0.2,vY) * (1.0-smoothstep(2.8,4.9,vY));
+  float pulse = 0.78 + 0.22*sin(uTime*.45 + vBeam*4.2 + vWorld.y*.9);
+  vec3 c = mix(vec3(0.36,0.28,0.17),vec3(0.94,0.77,0.47),0.72);
+  float alpha = (0.020 + 0.028*n) * longitudinal * pulse;
+  frag = vec4(c * (1.2 + n*.5), alpha);
+}`);
+
+const haloProgram = program(`#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uVP;
+uniform float uSize;
+void main(){
+  vec4 clip=uVP*vec4(aPos,1.0);
+  gl_Position=clip;
+  gl_PointSize=uSize/max(.35,abs(clip.w));
+}`, `#version 300 es
+precision highp float;
+out vec4 frag;
+void main(){
+  vec2 p=gl_PointCoord*2.0-1.0;
+  float d=dot(p,p);
+  if(d>1.0) discard;
+  float a=pow(1.0-d,2.2);
+  frag=vec4(vec3(1.0,.76,.38)*(a*1.8),a*.38);
+}`);
+
+const pVAO = gl.createVertexArray();
+const pPosBuffer = gl.createBuffer();
+const pSeedBuffer = gl.createBuffer();
+gl.bindVertexArray(pVAO);
+gl.bindBuffer(gl.ARRAY_BUFFER, pPosBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, positions.byteLength, gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+gl.bindBuffer(gl.ARRAY_BUFFER, pSeedBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, seeds.byteLength, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(1,1,gl.FLOAT,false,0,0);
+gl.bindVertexArray(null);
+
+function makeBeams() {
+  const arr = [];
+  const beams = 5;
+  const sides = 24;
+  for (let b=0;b<beams;b++) {
+    const ang = b / beams * Math.PI*2 + .35;
+    const ox = Math.cos(ang)*(0.35 + (b%2)*0.25);
+    const oz = Math.sin(ang)*(0.35 + (b%2)*0.25);
+    const topY = 4.5 + (b%3)*0.35;
+    const bottomY = -1.45;
+    const radius = 0.52 + (b%3)*0.23;
+    const topX = ox*0.45, topZ = oz*0.45;
+    for(let s=0;s<sides;s++){
+      const a0=s/sides*Math.PI*2, a1=(s+1)/sides*Math.PI*2;
+      arr.push(topX,topY,topZ,b);
+      arr.push(ox+Math.cos(a0)*radius,bottomY,oz+Math.sin(a0)*radius,b);
+      arr.push(ox+Math.cos(a1)*radius,bottomY,oz+Math.sin(a1)*radius,b);
+    }
+  }
+  return new Float32Array(arr);
+}
+const beamData = makeBeams();
+const beamVAO = gl.createVertexArray();
+const beamBuffer = gl.createBuffer();
+gl.bindVertexArray(beamVAO);
+gl.bindBuffer(gl.ARRAY_BUFFER, beamBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, beamData, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0,3,gl.FLOAT,false,16,0);
+gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(1,1,gl.FLOAT,false,16,12);
+gl.bindVertexArray(null);
+
+const haloVAO = gl.createVertexArray();
+const haloBuffer = gl.createBuffer();
+gl.bindVertexArray(haloVAO);
+gl.bindBuffer(gl.ARRAY_BUFFER,haloBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,4.6,0]), gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+gl.bindVertexArray(null);
+
+function randomizeParticle(i, c=center) {
+  const a = Math.random()*Math.PI*2;
+  const r = 1.45 + Math.pow(Math.random(),.65)*2.45;
+  const y = (Math.random()-.5)*2.7 + Math.sin(a*2.0)*.16;
+  const idx=i*3;
+  positions[idx+0]=c[0] + Math.cos(a)*r;
+  positions[idx+1]=c[1] + y;
+  positions[idx+2]=c[2] + Math.sin(a)*r;
+  const tangent = 0.34 + Math.random()*.48;
+  velocities[idx+0]=-Math.sin(a)*tangent;
+  velocities[idx+1]=(Math.random()-.5)*.12;
+  velocities[idx+2]= Math.cos(a)*tangent;
+  seeds[i]=Math.random();
+  targetR[i]=1.55 + Math.random()*2.1;
+}
+function resetField(c=center) {
+  for(let i=0;i<particleCount;i++) randomizeParticle(i,c);
+  gl.bindBuffer(gl.ARRAY_BUFFER,pSeedBuffer);
+  gl.bufferSubData(gl.ARRAY_BUFFER,0,seeds);
+  uploadParticles();
+}
+function uploadParticles(){
+  gl.bindBuffer(gl.ARRAY_BUFFER,pPosBuffer);
+  gl.bufferSubData(gl.ARRAY_BUFFER,0,positions);
+}
+
+function updateHeadVectors(){
+  quatRotate(head.forward, head.q, 0,0,-1);
+  quatRotate(head.right, head.q, 1,0,0);
+  quatRotate(head.up, head.q, 0,1,0);
+}
+
+function setDesktopHead(dt) {
+  if (motionEnabled) {
+    yaw = -deviceAlpha * Math.PI/180;
+    pitch = clamp(-deviceBeta * Math.PI/180 + Math.PI/2, -1.2, 1.2);
+  }
+  const cp=Math.cos(pitch), sp=Math.sin(pitch), sy=Math.sin(yaw), cy=Math.cos(yaw);
+  head.forward[0]=sy*cp; head.forward[1]=sp; head.forward[2]=-cy*cp;
+  head.right[0]=cy; head.right[1]=0; head.right[2]=sy;
+  cross3(head.up,head.right[0],head.right[1],head.right[2],head.forward[0],head.forward[1],head.forward[2]);
+  head.vel[0]=head.vel[1]=head.vel[2]=0;
+
+  // A desktop/mobile "virtual hand" makes the preview interactive too.
+  const h=hands[1];
+  h.active=true;
+  h.prevPos.set(h.pos);
+  const nx=pointerX/(innerWidth||1)*2-1;
+  const ny=1-pointerY/(innerHeight||1)*2;
+  h.pos[0]=center[0] + head.right[0]*nx*1.55 + head.up[0]*ny*.9 + head.forward[0]*1.25;
+  h.pos[1]=center[1] + head.right[1]*nx*1.55 + head.up[1]*ny*.9 + head.forward[1]*1.25;
+  h.pos[2]=center[2] + head.right[2]*nx*1.55 + head.up[2]*ny*.9 + head.forward[2]*1.25;
+  const inv=1/Math.max(.001,dt);
+  h.vel[0]=(h.pos[0]-h.prevPos[0])*inv;
+  h.vel[1]=(h.pos[1]-h.prevPos[1])*inv;
+  h.vel[2]=(h.pos[2]-h.prevPos[2])*inv;
+  h.trigger=pointerDown?1:0; h.squeeze=0;
+  hands[0].active=false;
+}
+
+function findHandSlot(handedness){
+  return handedness === 'left' ? hands[0] : hands[1];
+}
+function updateXRInput(frame, dt) {
+  for(const h of hands) { h.active=false; h.trigger=0; h.squeeze=0; }
+  if(!xrSession) return;
+  let stickCount=0, bx=0, bz=0;
+  for(const source of xrSession.inputSources) {
+    const h = findHandSlot(source.handedness);
+    let space = source.gripSpace || source.targetRaySpace;
+    if (source.hand && source.hand.get) {
+      const wrist = source.hand.get('wrist');
+      if (wrist) space = wrist;
+    }
+    const pose = space ? frame.getPose(space, xrRefSpace) : null;
+    if (pose) {
+      h.active=true;
+      h.prevPos.set(h.pos);
+      const p=pose.transform.position;
+      h.pos[0]=p.x; h.pos[1]=p.y; h.pos[2]=p.z;
+      const inv=1/Math.max(.001,dt);
+      h.vel[0]=(h.pos[0]-h.prevPos[0])*inv;
+      h.vel[1]=(h.pos[1]-h.prevPos[1])*inv;
+      h.vel[2]=(h.pos[2]-h.prevPos[2])*inv;
+    }
+    const gp=source.gamepad;
+    if(gp){
+      h.trigger=gp.buttons[0] ? gp.buttons[0].value : 0;
+      h.squeeze=gp.buttons[1] ? gp.buttons[1].value : 0;
+      if(gp.axes.length>=4){
+        bx += gp.axes[2]||0;
+        bz += gp.axes[3]||0;
+        stickCount++;
+      } else if(gp.axes.length>=2){
+        bx += gp.axes[0]||0;
+        bz += gp.axes[1]||0;
+        stickCount++;
+      }
+    }
+  }
+  if(stickCount){
+    fieldBiasX += (bx/stickCount - fieldBiasX)*Math.min(1,dt*8);
+    fieldBiasZ += (bz/stickCount - fieldBiasZ)*Math.min(1,dt*8);
+  } else {
+    fieldBiasX *= Math.exp(-dt*5);
+    fieldBiasZ *= Math.exp(-dt*5);
+  }
+}
+
+function simulate(dt,timeSec) {
+  dt=clamp(dt,1/180,1/28);
+  const axisX = head.right[1]*.72 + head.forward[0]*.16 + fieldBiasX*.18;
+  const axisY = 1.0 + head.forward[1]*.20;
+  const axisZ = head.forward[0]*.10 - head.right[1]*.22 + fieldBiasZ*.18;
+  normalize3(tmpA,axisX,axisY,axisZ);
+  const ax=tmpA[0], ay=tmpA[1], az=tmpA[2];
+
+  const damping=Math.exp(-1.55*dt);
+  const headSpeed = Math.min(2.5,len3(head.vel[0],head.vel[1],head.vel[2]));
+  const windX = head.forward[0]*.16 + head.right[1]*.28 + head.vel[0]*.12;
+  const windY = head.forward[1]*.11 + head.vel[1]*.07;
+  const windZ = head.forward[2]*.025 + head.vel[2]*.12;
+  const cx=center[0], cy=center[1], cz=center[2];
+
+  for(let i=0;i<particleCount;i++){
+    const k=i*3;
+    let x=positions[k], y=positions[k+1], z=positions[k+2];
+    let vx=velocities[k], vy=velocities[k+1], vz=velocities[k+2];
+    let rx=x-cx, ry=y-cy, rz=z-cz;
+    let d=Math.hypot(rx,ry*.78,rz)+1e-5;
+    const inv=1/d;
+    const nx=rx*inv, ny=ry*inv, nz=rz*inv;
+
+    // Tangent around a head-tilted vortex axis.
+    const tx=ay*nz-az*ny, ty=az*nx-ax*nz, tz=ax*ny-ay*nx;
+    const spring=(targetR[i]-d)*1.05;
+    const swirl=(1.15 + seeds[i]*.85) * (1.0 + headSpeed*.09);
+    let accx=tx*swirl + nx*spring + windX;
+    let accy=ty*swirl*.45 + ny*spring*.55 + windY;
+    let accz=tz*swirl + nz*spring + windZ;
+
+    // Breathing / flocking noise, deterministic and cheap.
+    const ph = timeSec*(.55+seeds[i]*.65) + seeds[i]*37.0;
+    accx += Math.sin(ph + y*.7)*.11;
+    accy += Math.cos(ph*.83 + x*.5)*.09;
+    accz += Math.sin(ph*.71 + z*.6)*.11;
+
+    // Keep a soft personal-space void around the viewer.
+    const hx=x-head.pos[0], hy=y-head.pos[1], hz=z-head.pos[2];
+    const hd=Math.hypot(hx,hy,hz)+1e-5;
+    if(hd<.72){
+      const f=(.72-hd)*5.8/hd;
+      accx+=hx*f; accy+=hy*f; accz+=hz*f;
+    }
+
+    // Each tracked hand becomes a moving local vortex. Trigger pulls, squeeze pushes.
+    for(let j=0;j<2;j++){
+      const h=hands[j];
+      if(!h.active) continue;
+      const dx=x-h.pos[0], dy=y-h.pos[1], dz=z-h.pos[2];
+      const dd=Math.hypot(dx,dy,dz)+1e-4;
+      if(dd<1.45){
+        const fall=(1-dd/1.45);
+        const q=fall*fall;
+        const invd=1/dd, ux=dx*invd, uy=dy*invd, uz=dz*invd;
+        const sign=h.sign;
+        // Local corkscrew around the hand, opposite chirality per hand.
+        accx += (-uz)*q*(2.3*sign);
+        accz += ( ux)*q*(2.3*sign);
+        accy += Math.sin((seeds[i]+timeSec)*6.0)*q*.35;
+        // The particles visibly inherit hand velocity as a wake.
+        accx += h.vel[0]*q*.62;
+        accy += h.vel[1]*q*.62;
+        accz += h.vel[2]*q*.62;
+        const radial = (h.squeeze*5.5 - h.trigger*4.2)*q;
+        accx += ux*radial; accy += uy*radial; accz += uz*radial;
+      }
+    }
+
+    vx=(vx+accx*dt)*damping;
+    vy=(vy+accy*dt)*damping;
+    vz=(vz+accz*dt)*damping;
+    const spd=Math.hypot(vx,vy,vz);
+    if(spd>4.8){ const s=4.8/spd; vx*=s; vy*=s; vz*=s; }
+    x+=vx*dt; y+=vy*dt; z+=vz*dt;
+
+    if(Math.hypot(x-cx,(y-cy)*.7,z-cz)>6.8 || y<cy-3.5 || y>cy+4.8){
+      randomizeParticle(i,center);
+      continue;
+    }
+    positions[k]=x; positions[k+1]=y; positions[k+2]=z;
+    velocities[k]=vx; velocities[k+1]=vy; velocities[k+2]=vz;
+  }
+  uploadParticles();
+}
+
+function resize(){
+  if(xrSession) return;
+  const dpr=Math.min(devicePixelRatio||1, isMobile?1.35:1.65);
+  const w=Math.max(2,Math.floor(innerWidth*dpr)), h=Math.max(2,Math.floor(innerHeight*dpr));
+  if(canvas.width!==w || canvas.height!==h){ canvas.width=w; canvas.height=h; }
+  gl.viewport(0,0,w,h);
+}
+addEventListener('resize',resize);
+
+function renderScene(vp, timeSec, pixelRatio) {
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LEQUAL);
+  gl.depthMask(false);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+
+  gl.useProgram(beamProgram);
+  gl.uniformMatrix4fv(gl.getUniformLocation(beamProgram,'uVP'),false,vp);
+  gl.uniform3f(gl.getUniformLocation(beamProgram,'uCenter'),center[0],center[1]-.2,center[2]);
+  gl.uniform1f(gl.getUniformLocation(beamProgram,'uTime'),timeSec);
+  gl.bindVertexArray(beamVAO);
+  gl.drawArrays(gl.TRIANGLES,0,beamData.length/4);
+
+  const haloPos = new Float32Array([center[0],center[1]+4.35,center[2]]);
+  gl.bindBuffer(gl.ARRAY_BUFFER,haloBuffer);
+  gl.bufferSubData(gl.ARRAY_BUFFER,0,haloPos);
+  gl.useProgram(haloProgram);
+  gl.uniformMatrix4fv(gl.getUniformLocation(haloProgram,'uVP'),false,vp);
+  gl.uniform1f(gl.getUniformLocation(haloProgram,'uSize'),190*pixelRatio);
+  gl.bindVertexArray(haloVAO);
+  gl.drawArrays(gl.POINTS,0,1);
+
+  gl.useProgram(particleProgram);
+  gl.uniformMatrix4fv(gl.getUniformLocation(particleProgram,'uVP'),false,vp);
+  gl.uniform1f(gl.getUniformLocation(particleProgram,'uPixelRatio'),pixelRatio);
+  gl.uniform1f(gl.getUniformLocation(particleProgram,'uTime'),timeSec);
+  gl.bindVertexArray(pVAO);
+  gl.drawArrays(gl.POINTS,0,particleCount);
+
+  gl.bindVertexArray(null);
+  gl.depthMask(true);
+  gl.disable(gl.BLEND);
+}
+
+function updateFPS(t){
+  fpsFrames++;
+  if(t-fpsClock>650){
+    const fps=fpsFrames*1000/(t-fpsClock);
+    fpsEl.textContent=(xrSession?'XR ':'')+fps.toFixed(0)+' fps · '+particleCount.toLocaleString()+' grains';
+    fpsFrames=0; fpsClock=t;
+  }
+}
+
+function desktopFrame(t){
+  if(xrSession) return;
+  desktopRAF=requestAnimationFrame(desktopFrame);
+  resize();
+  const dt=Math.min(.05,(t-lastTime)/1000 || .016);
+  lastTime=t;
+  setDesktopHead(dt);
+  simulate(dt,t/1000);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.clearColor(.012,.019,.030,1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+
+  const eye=[0,1.62,3.7];
+  const target=[eye[0]+head.forward[0]*3, eye[1]+head.forward[1]*3, eye[2]+head.forward[2]*3];
+  lookAt(mView,eye,target,[0,1,0]);
+  perspective(mProj,Math.PI/3,canvas.width/canvas.height,.04,40);
+  mat4Multiply(mVP,mProj,mView);
+  renderScene(mVP,t/1000,Math.min(devicePixelRatio||1,1.6));
+  updateFPS(t);
+}
+
+async function checkXR(){
+  if(!navigator.xr){
+    statusEl.textContent = window.isSecureContext
+      ? 'WebXR is not exposed by this browser. The desktop/mobile preview is active.'
+      : 'Preview active. Immersive WebXR requires HTTPS (or localhost) in a WebXR-capable browser.';
+    return;
+  }
+  try{
+    xrSupported = await navigator.xr.isSessionSupported('immersive-vr');
+  }catch(e){ xrSupported=false; }
+  if(xrSupported){
+    vrBtn.disabled=false;
+    statusEl.textContent='WebXR ready. Enter VR for 6DoF head, controller, and hand-reactive grains.';
+  }else{
+    statusEl.textContent='This browser reports no immersive-vr device. Interactive preview remains available.';
+  }
+}
+async function enterXR(){
+  if(!xrSupported || xrSession) return;
+  try{
+    await gl.makeXRCompatible();
+    xrSession = await navigator.xr.requestSession('immersive-vr',{
+      optionalFeatures:['local-floor','bounded-floor','hand-tracking']
+    });
+    xrSession.addEventListener('end', onXREnd, {once:true});
+    try{ xrRefSpace=await xrSession.requestReferenceSpace('local-floor'); }
+    catch(e){ xrRefSpace=await xrSession.requestReferenceSpace('local'); }
+
+    const nativeScale = (window.XRWebGLLayer && XRWebGLLayer.getNativeFramebufferScaleFactor)
+      ? XRWebGLLayer.getNativeFramebufferScaleFactor(xrSession) : 1;
+    const scale = Math.min(1, nativeScale * (isMobile?.82:.92));
+    xrLayer = new XRWebGLLayer(xrSession,gl,{
+      alpha:false, antialias:false, depth:true, stencil:false,
+      framebufferScaleFactor:scale
+    });
+    xrSession.updateRenderState({baseLayer:xrLayer,depthNear:.04,depthFar:42});
+    cancelAnimationFrame(desktopRAF);
+    vrBtn.textContent='Exit VR';
+    ui.classList.add('quiet');
+    xrFirstPose=true;
+    lastTime=performance.now();
+    xrSession.requestAnimationFrame(xrFrame);
+  }catch(e){
+    console.error(e);
+    statusEl.textContent='VR session could not start: '+(e && e.message ? e.message : e);
+    xrSession=null;
+    vrBtn.textContent='Enter VR';
+    desktopRAF=requestAnimationFrame(desktopFrame);
+  }
+}
+function onXREnd(){
+  xrSession=null; xrRefSpace=null; xrLayer=null;
+  vrBtn.textContent='Enter VR';
+  ui.classList.remove('quiet');
+  lastTime=performance.now();
+  desktopRAF=requestAnimationFrame(desktopFrame);
+}
+function xrFrame(t,frame){
+  const session=frame.session;
+  if(!xrSession || session!==xrSession) return;
+  session.requestAnimationFrame(xrFrame);
+  const dt=Math.min(.05,(t-lastTime)/1000 || .011);
+  lastTime=t;
+  const pose=frame.getViewerPose(xrRefSpace);
+  if(!pose) return;
+
+  head.prevPos.set(head.pos);
+  const hp=pose.transform.position, hq=pose.transform.orientation;
+  head.pos[0]=hp.x; head.pos[1]=hp.y; head.pos[2]=hp.z;
+  head.q[0]=hq.x; head.q[1]=hq.y; head.q[2]=hq.z; head.q[3]=hq.w;
+  const inv=1/Math.max(.001,dt);
+  head.vel[0]=(head.pos[0]-head.prevPos[0])*inv;
+  head.vel[1]=(head.pos[1]-head.prevPos[1])*inv;
+  head.vel[2]=(head.pos[2]-head.prevPos[2])*inv;
+  updateHeadVectors();
+
+  // Follow the user's physical position while keeping the vortex centered below the head.
+  center[0] += (head.pos[0]-center[0]) * Math.min(1,dt*4.5);
+  center[1] += ((head.pos[1]-.18)-center[1]) * Math.min(1,dt*3.0);
+  center[2] += (head.pos[2]-center[2]) * Math.min(1,dt*4.5);
+
+  if(xrFirstPose){
+    resetField(center);
+    xrFirstPose=false;
+  }
+  updateXRInput(frame,dt);
+  simulate(dt,t/1000);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER,xrLayer.framebuffer);
+  gl.clearColor(.012,.019,.030,1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  for(const view of pose.views){
+    const vp=xrLayer.getViewport(view);
+    if(!vp || vp.width<=0 || vp.height<=0) continue;
+    gl.viewport(vp.x,vp.y,vp.width,vp.height);
+    mView.set(view.transform.inverse.matrix);
+    mProj.set(view.projectionMatrix);
+    mat4Multiply(mVP,mProj,mView);
+    renderScene(mVP,t/1000,1.0);
+  }
+  updateFPS(t);
+}
+
+vrBtn.addEventListener('click',()=>{
+  if(xrSession) xrSession.end();
+  else enterXR();
+});
+fsBtn.addEventListener('click',async()=>{
+  try{
+    if(!document.fullscreenElement) await document.documentElement.requestFullscreen();
+    else await document.exitFullscreen();
+  }catch(e){}
+});
+resetBtn.addEventListener('click',()=>resetField(center));
+
+canvas.addEventListener('pointerdown',e=>{
+  pointerDown=true; lastPointerX=e.clientX; lastPointerY=e.clientY;
+  pointerX=e.clientX; pointerY=e.clientY;
+  canvas.setPointerCapture?.(e.pointerId);
+});
+canvas.addEventListener('pointermove',e=>{
+  pointerX=e.clientX; pointerY=e.clientY;
+  if(pointerDown && !motionEnabled && !xrSession){
+    const dx=e.clientX-lastPointerX, dy=e.clientY-lastPointerY;
+    if(e.pointerType==='mouse' && (e.buttons&1)){
+      yaw -= dx*.0031;
+      pitch = clamp(pitch-dy*.0025,-1.35,1.35);
+    }
+    lastPointerX=e.clientX; lastPointerY=e.clientY;
+  }
+});
+canvas.addEventListener('pointerup',e=>{ pointerDown=false; canvas.releasePointerCapture?.(e.pointerId); });
+canvas.addEventListener('pointercancel',()=>{pointerDown=false;});
+pointerX=innerWidth*.72; pointerY=innerHeight*.58;
+
+function onOrientation(e){
+  if(e.alpha==null) return;
+  deviceAlpha=e.alpha||0; deviceBeta=e.beta||0; deviceGamma=e.gamma||0;
+}
+async function enableMotion(){
+  try{
+    if(typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function'){
+      const p=await DeviceOrientationEvent.requestPermission();
+      if(p!=='granted') throw new Error('permission denied');
+    }
+    addEventListener('deviceorientation',onOrientation,true);
+    motionEnabled=true;
+    motionBtn.textContent='Motion on';
+    statusEl.textContent = xrSupported
+      ? 'Device tilt is active in preview; WebXR is also available.'
+      : 'Device tilt is active; move the phone to steer and tilt the grain vortex.';
+  }catch(e){
+    statusEl.textContent='Motion permission was not granted.';
+  }
+}
+if(typeof DeviceOrientationEvent!=='undefined'){
+  motionBtn.hidden=false;
+  motionBtn.addEventListener('click',enableMotion);
+}
+
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden && !xrSession) lastTime=performance.now();
+});
+
+resetField(center);
+resize();
+checkXR();
+desktopRAF=requestAnimationFrame(desktopFrame);
+})();
+</script>
+</body>
+</html>
