@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <meta name="theme-color" content="#05070a">
-<title>Grainfield XR</title>
+<title>Infinite Grainfield XR — Volumetric + Singularities</title>
 <style>
   :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   * { box-sizing: border-box; }
@@ -45,7 +45,7 @@
 
 <div id="ui">
   <div class="top">
-    <h1>Grainfield XR</h1>
+    <h1>Infinite Grainfield XR</h1>
     <div id="readout"><span class="dot"></span><span id="fps">—</span></div>
   </div>
   <div id="status">Initializing WebGL2 and checking WebXR…</div>
@@ -56,8 +56,8 @@
     <button id="reset">Reset field</button>
   </div>
   <div class="hint">
-    VR: move your head and sweep either controller/hand through the grains. Trigger attracts; squeeze repels.
-    Thumbsticks bias the current. Desktop/mobile: drag or tilt the device; press/hold to pull the grains.
+    VR: true ray-marched volumetric light + an infinite grain field. Trigger attracts; squeeze repels.
+    Press a thumbstick (or an exposed extra controller button) to collapse a persistent singularity at that hand. Secondary extra button clears the nearest singularity.
   </div>
 </div>
 
@@ -126,16 +126,27 @@ function makeHand(name, sign) {
     pos:new Float32Array([sign*.5,1.25,-.8]),
     prevPos:new Float32Array([sign*.5,1.25,-.8]),
     vel:new Float32Array(3),
-    trigger:0, squeeze:0
+    q:new Float32Array([0,0,0,1]),
+    forward:new Float32Array([0,0,-1]),
+    trigger:0, squeeze:0,
+    spawnPrev:false, clearPrev:false
   };
 }
 
 const center = new Float32Array([0,1.35,0]);
-let particleCount = isMobile ? 7600 : 11800;
+let particleCount = isMobile ? 14500 : 26000;
 const positions = new Float32Array(particleCount * 3);
 const velocities = new Float32Array(particleCount * 3);
 const seeds = new Float32Array(particleCount);
 const targetR = new Float32Array(particleCount);
+const FIELD_NEAR = 0.65;
+const FIELD_FADE_START = isMobile ? 8.5 : 10.5;
+const FIELD_RADIUS = isMobile ? 13.5 : 17.5;
+
+const MAX_SINGULARITIES = 8;
+const singularities = [];
+const singularityGPU = new Float32Array(MAX_SINGULARITIES * 4); // xyz + chirality
+let singularityDirty = true;
 
 const tmpA = new Float32Array(3);
 const tmpB = new Float32Array(3);
@@ -175,6 +186,37 @@ function mat4Multiply(out,a,b){
   }
   out.set(o); return out;
 }
+function mat4Invert(out, a){
+  const a00=a[0],a01=a[1],a02=a[2],a03=a[3];
+  const a10=a[4],a11=a[5],a12=a[6],a13=a[7];
+  const a20=a[8],a21=a[9],a22=a[10],a23=a[11];
+  const a30=a[12],a31=a[13],a32=a[14],a33=a[15];
+  const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10;
+  const b03=a01*a12-a02*a11, b04=a01*a13-a03*a11, b05=a02*a13-a03*a12;
+  const b06=a20*a31-a21*a30, b07=a20*a32-a22*a30, b08=a20*a33-a23*a30;
+  const b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+  let det=b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+  if(!det) return false;
+  det=1.0/det;
+  out[0]=( a11*b11-a12*b10+a13*b09)*det;
+  out[1]=(-a01*b11+a02*b10-a03*b09)*det;
+  out[2]=( a31*b05-a32*b04+a33*b03)*det;
+  out[3]=(-a21*b05+a22*b04-a23*b03)*det;
+  out[4]=(-a10*b11+a12*b08-a13*b07)*det;
+  out[5]=( a00*b11-a02*b08+a03*b07)*det;
+  out[6]=(-a30*b05+a32*b02-a33*b01)*det;
+  out[7]=( a20*b05-a22*b02+a23*b01)*det;
+  out[8]=( a10*b10-a11*b08+a13*b06)*det;
+  out[9]=(-a00*b10+a01*b08-a03*b06)*det;
+  out[10]=(a30*b04-a31*b02+a33*b00)*det;
+  out[11]=(-a20*b04+a21*b02-a23*b00)*det;
+  out[12]=(-a10*b09+a11*b07-a12*b06)*det;
+  out[13]=( a00*b09-a01*b07+a02*b06)*det;
+  out[14]=(-a30*b03+a31*b01-a32*b00)*det;
+  out[15]=( a20*b03-a21*b01+a22*b00)*det;
+  return true;
+}
+
 function perspective(out, fovy, aspect, near, far){
   const f=1/Math.tan(fovy/2);
   out.fill(0);
@@ -224,22 +266,28 @@ precision highp float;
 layout(location=0) in vec3 aPos;
 layout(location=1) in float aSeed;
 uniform mat4 uVP;
+uniform vec3 uCameraPos;
 uniform float uPixelRatio;
 uniform float uTime;
 out float vSeed;
 out float vDepth;
+out float vDistance;
 void main(){
   vec4 clip = uVP * vec4(aPos,1.0);
   gl_Position = clip;
   float nd = max(0.18, abs(clip.w));
-  gl_PointSize = clamp(uPixelRatio * (9.0 / nd), 1.3, 8.5);
+  gl_PointSize = clamp(uPixelRatio * (10.5 / nd), 1.15, 9.0);
   vSeed = aSeed;
   vDepth = nd;
+  vDistance = distance(aPos, uCameraPos);
 }`, `#version 300 es
 precision highp float;
 in float vSeed;
 in float vDepth;
+in float vDistance;
 uniform float uTime;
+uniform float uFadeStart;
+uniform float uFadeEnd;
 out vec4 frag;
 void main(){
   vec2 p = gl_PointCoord * 2.0 - 1.0;
@@ -252,64 +300,139 @@ void main(){
   float edge = smoothstep(1.0,0.18,d);
   float core = pow(max(0.0,1.0-d),2.6);
   float tw = 0.78 + 0.22*sin(uTime*2.1 + vSeed*31.0);
+  float distanceFade = 1.0 - smoothstep(uFadeStart, uFadeEnd, vDistance);
+  float nearFade = smoothstep(0.38, 0.72, vDistance);
   vec3 amber = vec3(0.87,0.67,0.38);
   vec3 ivory = vec3(1.0,0.94,0.77);
   vec3 col = mix(amber,ivory,0.35 + 0.55*fract(vSeed*8.7));
-  frag = vec4(col * (0.35 + 1.35*core) * tw, edge * (0.32 + 0.55*core));
+  float alpha = edge * (0.28 + 0.60*core) * distanceFade * nearFade;
+  frag = vec4(col * (0.34 + 1.45*core) * tw * distanceFade, alpha);
 }`);
 
-const beamProgram = program(`#version 300 es
+const volumeProgram = program(`#version 300 es
 precision highp float;
-layout(location=0) in vec3 aPos;
-layout(location=1) in float aBeam;
-uniform mat4 uVP;
-uniform vec3 uCenter;
-uniform float uTime;
-out float vY;
-out float vBeam;
-out vec3 vWorld;
+out vec2 vUv;
+const vec2 P[3] = vec2[](vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));
 void main(){
-  vec3 wobble = vec3(sin(uTime*.17+aBeam*3.1),0.0,cos(uTime*.13+aBeam*2.7))*0.13;
-  vec3 world = aPos + uCenter + wobble;
-  vWorld = world;
-  vY = aPos.y;
-  vBeam = aBeam;
-  gl_Position = uVP * vec4(world,1.0);
+  vec2 p=P[gl_VertexID];
+  vUv=p*0.5+0.5;
+  gl_Position=vec4(p,0.0,1.0);
 }`, `#version 300 es
 precision highp float;
-in float vY;
-in float vBeam;
-in vec3 vWorld;
+in vec2 vUv;
+uniform mat4 uInvVP;
+uniform vec3 uCameraPos;
+uniform vec3 uLightPos;
+uniform vec3 uLightDir;
 uniform float uTime;
+uniform float uFar;
+uniform int uSteps;
 out vec4 frag;
-float hash(vec3 p){ return fract(sin(dot(p,vec3(12.9898,78.233,37.719)))*43758.5453); }
+
+float hash31(vec3 p){
+  p=fract(p*0.1031);
+  p+=dot(p,p.yzx+33.33);
+  return fract((p.x+p.y)*p.z);
+}
+float noise3(vec3 p){
+  vec3 i=floor(p), f=fract(p);
+  f=f*f*(3.0-2.0*f);
+  float n000=hash31(i+vec3(0,0,0));
+  float n100=hash31(i+vec3(1,0,0));
+  float n010=hash31(i+vec3(0,1,0));
+  float n110=hash31(i+vec3(1,1,0));
+  float n001=hash31(i+vec3(0,0,1));
+  float n101=hash31(i+vec3(1,0,1));
+  float n011=hash31(i+vec3(0,1,1));
+  float n111=hash31(i+vec3(1,1,1));
+  return mix(mix(mix(n000,n100,f.x),mix(n010,n110,f.x),f.y),
+             mix(mix(n001,n101,f.x),mix(n011,n111,f.x),f.y),f.z);
+}
+float hg(float c,float g){
+  float g2=g*g;
+  return (1.0-g2)/max(0.18,pow(1.0+g2-2.0*g*c,1.5));
+}
 void main(){
-  float n = hash(floor(vWorld*4.0 + vec3(0.0,uTime*.2,0.0)));
-  float longitudinal = smoothstep(-1.6,-0.2,vY) * (1.0-smoothstep(2.8,4.9,vY));
-  float pulse = 0.78 + 0.22*sin(uTime*.45 + vBeam*4.2 + vWorld.y*.9);
-  vec3 c = mix(vec3(0.36,0.28,0.17),vec3(0.94,0.77,0.47),0.72);
-  float alpha = (0.020 + 0.028*n) * longitudinal * pulse;
-  frag = vec4(c * (1.2 + n*.5), alpha);
+  vec2 ndc=vUv*2.0-1.0;
+  vec4 wf=uInvVP*vec4(ndc,1.0,1.0);
+  vec3 farP=wf.xyz/wf.w;
+  vec3 rd=normalize(farP-uCameraPos);
+
+  float maxT=uFar;
+  float stepLen=maxT/float(max(uSteps,1));
+  float jitter=hash31(vec3(gl_FragCoord.xy,fract(uTime)))-0.5;
+  float optical=0.0;
+  vec3 scatter=vec3(0.0);
+
+  for(int i=0;i<32;i++){
+    if(i>=uSteps) break;
+    float t=(float(i)+0.5+jitter*0.45)*stepLen;
+    vec3 p=uCameraPos+rd*t;
+
+    vec3 lp=p-uLightPos;
+    float along=dot(lp,uLightDir);
+    vec3 off=lp-uLightDir*along;
+    float radial=length(off);
+
+    // A procedural spotlight volume. This is sampled participating media,
+    // not translucent cone geometry.
+    float coneR=max(0.25,along*0.22);
+    float cone=step(0.0,along)*(1.0-smoothstep(coneR*0.22,coneR,radial));
+
+    float n=noise3(p*0.42+vec3(0.0,uTime*0.035,0.0));
+    float n2=noise3(p*1.17+vec3(uTime*0.022,0.0,-uTime*0.018));
+    float medium=(0.010+0.034*n+0.016*n2);
+
+    // Break the shaft into moving filaments rather than a uniform fog cone.
+    float filament=0.58+0.42*sin(dot(p.xz,vec2(1.7,-1.15))+p.y*.31+n*4.0);
+    filament=0.50+0.50*filament*filament;
+
+    float phase=hg(dot(rd,-uLightDir),0.64);
+    float attenuation=exp(-max(along,0.0)*0.035);
+    float local=medium*cone*filament*phase*attenuation;
+    scatter += vec3(1.00,0.78,0.45)*local*stepLen*5.4*exp(-optical*.55);
+    optical += medium*stepLen*.55;
+  }
+
+  // Tonemap only this scattering contribution; rendered additively over space.
+  scatter=1.0-exp(-scatter);
+  float a=clamp(max(scatter.r,max(scatter.g,scatter.b))*0.72,0.0,0.82);
+  frag=vec4(scatter,a);
 }`);
 
-const haloProgram = program(`#version 300 es
+const singularityProgram = program(`#version 300 es
 precision highp float;
-layout(location=0) in vec3 aPos;
+layout(location=0) in vec4 aSingularity;
 uniform mat4 uVP;
-uniform float uSize;
+uniform float uPixelRatio;
+out float vChirality;
 void main(){
-  vec4 clip=uVP*vec4(aPos,1.0);
+  vec4 clip=uVP*vec4(aSingularity.xyz,1.0);
   gl_Position=clip;
-  gl_PointSize=uSize/max(.35,abs(clip.w));
+  gl_PointSize=clamp(uPixelRatio*(205.0/max(0.24,abs(clip.w))),24.0,220.0);
+  vChirality=aSingularity.w;
 }`, `#version 300 es
 precision highp float;
+in float vChirality;
+uniform float uTime;
 out vec4 frag;
 void main(){
   vec2 p=gl_PointCoord*2.0-1.0;
-  float d=dot(p,p);
-  if(d>1.0) discard;
-  float a=pow(1.0-d,2.2);
-  frag=vec4(vec3(1.0,.76,.38)*(a*1.8),a*.38);
+  float r=length(p);
+  if(r>1.0) discard;
+  float a=atan(p.y,p.x);
+  float spiral=0.5+0.5*sin(a*5.0*vChirality-r*24.0-uTime*3.5*vChirality);
+  float disk=exp(-pow((r-.45)*7.5,2.0));
+  float ring=exp(-pow((r-.62)*18.0,2.0));
+  float glow=pow(max(0.0,1.0-r),3.0);
+  float horizon=1.0-smoothstep(.14,.205,r);
+  vec3 amber=vec3(1.0,.55,.16);
+  vec3 hot=vec3(1.0,.92,.66);
+  vec3 c=(amber*(disk*(.35+.85*spiral))+hot*ring*1.7+amber*glow*.35);
+  // Black event horizon with an emissive accretion disk.
+  if(horizon>0.02){ frag=vec4(vec3(0.0),0.94*horizon); return; }
+  float alpha=clamp(disk*.72+ring*.92+glow*.20,0.0,.96);
+  frag=vec4(c,alpha);
 }`);
 
 const pVAO = gl.createVertexArray();
@@ -326,62 +449,75 @@ gl.enableVertexAttribArray(1);
 gl.vertexAttribPointer(1,1,gl.FLOAT,false,0,0);
 gl.bindVertexArray(null);
 
-function makeBeams() {
-  const arr = [];
-  const beams = 5;
-  const sides = 24;
-  for (let b=0;b<beams;b++) {
-    const ang = b / beams * Math.PI*2 + .35;
-    const ox = Math.cos(ang)*(0.35 + (b%2)*0.25);
-    const oz = Math.sin(ang)*(0.35 + (b%2)*0.25);
-    const topY = 4.5 + (b%3)*0.35;
-    const bottomY = -1.45;
-    const radius = 0.52 + (b%3)*0.23;
-    const topX = ox*0.45, topZ = oz*0.45;
-    for(let s=0;s<sides;s++){
-      const a0=s/sides*Math.PI*2, a1=(s+1)/sides*Math.PI*2;
-      arr.push(topX,topY,topZ,b);
-      arr.push(ox+Math.cos(a0)*radius,bottomY,oz+Math.sin(a0)*radius,b);
-      arr.push(ox+Math.cos(a1)*radius,bottomY,oz+Math.sin(a1)*radius,b);
-    }
+const singularityVAO = gl.createVertexArray();
+const singularityBuffer = gl.createBuffer();
+gl.bindVertexArray(singularityVAO);
+gl.bindBuffer(gl.ARRAY_BUFFER,singularityBuffer);
+gl.bufferData(gl.ARRAY_BUFFER,singularityGPU.byteLength,gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0,4,gl.FLOAT,false,0,0);
+gl.bindVertexArray(null);
+
+function uploadSingularities(){
+  singularityGPU.fill(0);
+  for(let i=0;i<singularities.length;i++){
+    const s=singularities[i], k=i*4;
+    singularityGPU[k]=s.pos[0];
+    singularityGPU[k+1]=s.pos[1];
+    singularityGPU[k+2]=s.pos[2];
+    singularityGPU[k+3]=s.chirality;
   }
-  return new Float32Array(arr);
+  gl.bindBuffer(gl.ARRAY_BUFFER,singularityBuffer);
+  gl.bufferSubData(gl.ARRAY_BUFFER,0,singularityGPU);
+  singularityDirty=false;
 }
-const beamData = makeBeams();
-const beamVAO = gl.createVertexArray();
-const beamBuffer = gl.createBuffer();
-gl.bindVertexArray(beamVAO);
-gl.bindBuffer(gl.ARRAY_BUFFER, beamBuffer);
-gl.bufferData(gl.ARRAY_BUFFER, beamData, gl.STATIC_DRAW);
-gl.enableVertexAttribArray(0);
-gl.vertexAttribPointer(0,3,gl.FLOAT,false,16,0);
-gl.enableVertexAttribArray(1);
-gl.vertexAttribPointer(1,1,gl.FLOAT,false,16,12);
-gl.bindVertexArray(null);
 
-const haloVAO = gl.createVertexArray();
-const haloBuffer = gl.createBuffer();
-gl.bindVertexArray(haloVAO);
-gl.bindBuffer(gl.ARRAY_BUFFER,haloBuffer);
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,4.6,0]), gl.DYNAMIC_DRAW);
-gl.enableVertexAttribArray(0);
-gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
-gl.bindVertexArray(null);
+function spawnSingularity(hand, boost=1.0){
+  if(!hand || !hand.active) return;
+  if(singularities.length>=MAX_SINGULARITIES) singularities.shift();
+  singularities.push({
+    pos:new Float32Array(hand.pos),
+    axis:new Float32Array(hand.forward),
+    chirality:hand.sign,
+    strength:10.5*boost,
+    radius:5.6+0.8*boost,
+    core:0.13,
+    born:performance.now()/1000
+  });
+  singularityDirty=true;
+}
+function clearNearestSingularity(hand){
+  if(!hand || !hand.active || !singularities.length) return;
+  let best=-1, bestD=Infinity;
+  for(let i=0;i<singularities.length;i++){
+    const s=singularities[i];
+    const d=Math.hypot(s.pos[0]-hand.pos[0],s.pos[1]-hand.pos[1],s.pos[2]-hand.pos[2]);
+    if(d<bestD){ bestD=d; best=i; }
+  }
+  if(best>=0){ singularities.splice(best,1); singularityDirty=true; }
+}
 
-function randomizeParticle(i, c=center) {
-  const a = Math.random()*Math.PI*2;
-  const r = 1.45 + Math.pow(Math.random(),.65)*2.45;
-  const y = (Math.random()-.5)*2.7 + Math.sin(a*2.0)*.16;
+function randomizeParticle(i, c=center, outerShell=false) {
+  const z = Math.random()*2.0 - 1.0;
+  const a = Math.random()*Math.PI*2.0;
+  const s = Math.sqrt(Math.max(0.0, 1.0-z*z));
+  const dx = Math.cos(a)*s;
+  const dy = z;
+  const dz = Math.sin(a)*s;
+  const u = Math.random();
+  const r = outerShell
+    ? FIELD_FADE_START + Math.random()*(FIELD_RADIUS-FIELD_FADE_START)
+    : FIELD_NEAR + Math.pow(u, 0.72)*(FIELD_RADIUS-FIELD_NEAR);
   const idx=i*3;
-  positions[idx+0]=c[0] + Math.cos(a)*r;
-  positions[idx+1]=c[1] + y;
-  positions[idx+2]=c[2] + Math.sin(a)*r;
-  const tangent = 0.34 + Math.random()*.48;
-  velocities[idx+0]=-Math.sin(a)*tangent;
-  velocities[idx+1]=(Math.random()-.5)*.12;
-  velocities[idx+2]= Math.cos(a)*tangent;
+  positions[idx+0]=c[0] + dx*r;
+  positions[idx+1]=c[1] + dy*r;
+  positions[idx+2]=c[2] + dz*r;
+  const drift = 0.10 + Math.random()*0.30;
+  velocities[idx+0]=(-dz*.55 + (Math.random()-.5)*.65)*drift;
+  velocities[idx+1]=((Math.random()-.5)*.85)*drift;
+  velocities[idx+2]=( dx*.55 + (Math.random()-.5)*.65)*drift;
   seeds[i]=Math.random();
-  targetR[i]=1.55 + Math.random()*2.1;
+  targetR[i]=r;
 }
 function resetField(c=center) {
   for(let i=0;i<particleCount;i++) randomizeParticle(i,c);
@@ -432,11 +568,12 @@ function findHandSlot(handedness){
   return handedness === 'left' ? hands[0] : hands[1];
 }
 function updateXRInput(frame, dt) {
-  for(const h of hands) { h.active=false; h.trigger=0; h.squeeze=0; }
+  for(const h of hands) { h.active=false; h.trigger=0; h.squeeze=0; h._seen=false; }
   if(!xrSession) return;
   let stickCount=0, bx=0, bz=0;
   for(const source of xrSession.inputSources) {
     const h = findHandSlot(source.handedness);
+    h._seen=true;
     let space = source.gripSpace || source.targetRaySpace;
     if (source.hand && source.hand.get) {
       const wrist = source.hand.get('wrist');
@@ -447,7 +584,10 @@ function updateXRInput(frame, dt) {
       h.active=true;
       h.prevPos.set(h.pos);
       const p=pose.transform.position;
+      const q=pose.transform.orientation;
       h.pos[0]=p.x; h.pos[1]=p.y; h.pos[2]=p.z;
+      h.q[0]=q.x; h.q[1]=q.y; h.q[2]=q.z; h.q[3]=q.w;
+      quatRotate(h.forward,h.q,0,0,-1);
       const inv=1/Math.max(.001,dt);
       h.vel[0]=(h.pos[0]-h.prevPos[0])*inv;
       h.vel[1]=(h.pos[1]-h.prevPos[1])*inv;
@@ -457,6 +597,19 @@ function updateXRInput(frame, dt) {
     if(gp){
       h.trigger=gp.buttons[0] ? gp.buttons[0].value : 0;
       h.squeeze=gp.buttons[1] ? gp.buttons[1].value : 0;
+
+      // xr-standard reserves [3] for the primary thumbstick press and [2]
+      // for touchpad press. Extra device/profile buttons follow those slots.
+      const stickPress=!!(gp.buttons[3] && gp.buttons[3].pressed);
+      const padPress=!!(gp.buttons[2] && gp.buttons[2].pressed);
+      const extraPrimary=!!(gp.buttons[4] && gp.buttons[4].pressed);
+      const extraSecondary=!!(gp.buttons[5] && gp.buttons[5].pressed);
+      const spawnPressed=stickPress || padPress || extraPrimary;
+      if(spawnPressed && !h.spawnPrev) spawnSingularity(h, extraPrimary?1.18:1.0);
+      if(extraSecondary && !h.clearPrev) clearNearestSingularity(h);
+      h.spawnPrev=spawnPressed;
+      h.clearPrev=extraSecondary;
+
       if(gp.axes.length>=4){
         bx += gp.axes[2]||0;
         bz += gp.axes[3]||0;
@@ -468,6 +621,7 @@ function updateXRInput(frame, dt) {
       }
     }
   }
+  for(const h of hands){ if(!h._seen){ h.spawnPrev=false; h.clearPrev=false; } }
   if(stickCount){
     fieldBiasX += (bx/stickCount - fieldBiasX)*Math.min(1,dt*8);
     fieldBiasZ += (bz/stickCount - fieldBiasZ)*Math.min(1,dt*8);
@@ -479,73 +633,80 @@ function updateXRInput(frame, dt) {
 
 function simulate(dt,timeSec) {
   dt=clamp(dt,1/180,1/28);
-  const axisX = head.right[1]*.72 + head.forward[0]*.16 + fieldBiasX*.18;
-  const axisY = 1.0 + head.forward[1]*.20;
-  const axisZ = head.forward[0]*.10 - head.right[1]*.22 + fieldBiasZ*.18;
-  normalize3(tmpA,axisX,axisY,axisZ);
-  const ax=tmpA[0], ay=tmpA[1], az=tmpA[2];
-
-  const damping=Math.exp(-1.55*dt);
-  const headSpeed = Math.min(2.5,len3(head.vel[0],head.vel[1],head.vel[2]));
-  const windX = head.forward[0]*.16 + head.right[1]*.28 + head.vel[0]*.12;
-  const windY = head.forward[1]*.11 + head.vel[1]*.07;
-  const windZ = head.forward[2]*.025 + head.vel[2]*.12;
-  const cx=center[0], cy=center[1], cz=center[2];
-
+  const damping=Math.exp(-0.48*dt);
+  const headSpeed = Math.min(3.0,len3(head.vel[0],head.vel[1],head.vel[2]));
+  const windX = head.forward[0]*.060 + head.right[1]*.080 + head.vel[0]*.075 + fieldBiasX*.11;
+  const windY = head.forward[1]*.045 + head.vel[1]*.055;
+  const windZ = head.forward[2]*.018 + head.vel[2]*.075 + fieldBiasZ*.11;
+  const cx=head.pos[0], cy=head.pos[1], cz=head.pos[2];
   for(let i=0;i<particleCount;i++){
     const k=i*3;
     let x=positions[k], y=positions[k+1], z=positions[k+2];
     let vx=velocities[k], vy=velocities[k+1], vz=velocities[k+2];
-    let rx=x-cx, ry=y-cy, rz=z-cz;
-    let d=Math.hypot(rx,ry*.78,rz)+1e-5;
-    const inv=1/d;
-    const nx=rx*inv, ny=ry*inv, nz=rz*inv;
-
-    // Tangent around a head-tilted vortex axis.
-    const tx=ay*nz-az*ny, ty=az*nx-ax*nz, tz=ax*ny-ay*nx;
-    const spring=(targetR[i]-d)*1.05;
-    const swirl=(1.15 + seeds[i]*.85) * (1.0 + headSpeed*.09);
-    let accx=tx*swirl + nx*spring + windX;
-    let accy=ty*swirl*.45 + ny*spring*.55 + windY;
-    let accz=tz*swirl + nz*spring + windZ;
-
-    // Breathing / flocking noise, deterministic and cheap.
-    const ph = timeSec*(.55+seeds[i]*.65) + seeds[i]*37.0;
-    accx += Math.sin(ph + y*.7)*.11;
-    accy += Math.cos(ph*.83 + x*.5)*.09;
-    accz += Math.sin(ph*.71 + z*.6)*.11;
-
-    // Keep a soft personal-space void around the viewer.
-    const hx=x-head.pos[0], hy=y-head.pos[1], hz=z-head.pos[2];
-    const hd=Math.hypot(hx,hy,hz)+1e-5;
-    if(hd<.72){
-      const f=(.72-hd)*5.8/hd;
-      accx+=hx*f; accy+=hy*f; accz+=hz*f;
+    const rx=x-cx, ry=y-cy, rz=z-cz;
+    const d=Math.hypot(rx,ry,rz)+1e-5;
+    const ph = timeSec*(.20+seeds[i]*.31) + seeds[i]*41.0;
+    let accx = Math.sin(ph + y*.33 + z*.19)*.070 + windX;
+    let accy = Math.cos(ph*.83 + x*.27 - z*.13)*.055 + windY;
+    let accz = Math.sin(ph*.71 - x*.21 + y*.29)*.070 + windZ;
+    if(d<2.8){
+      const q=1.0-d/2.8;
+      accx += head.vel[0]*q*.18;
+      accy += head.vel[1]*q*.18;
+      accz += head.vel[2]*q*.18;
     }
-
-    // Each tracked hand becomes a moving local vortex. Trigger pulls, squeeze pushes.
+    if(d<.66){
+      const f=(.66-d)*7.0/d;
+      accx+=rx*f; accy+=ry*f; accz+=rz*f;
+    }
     for(let j=0;j<2;j++){
       const h=hands[j];
       if(!h.active) continue;
       const dx=x-h.pos[0], dy=y-h.pos[1], dz=z-h.pos[2];
       const dd=Math.hypot(dx,dy,dz)+1e-4;
-      if(dd<1.45){
-        const fall=(1-dd/1.45);
+      if(dd<1.65){
+        const fall=(1-dd/1.65);
         const q=fall*fall;
         const invd=1/dd, ux=dx*invd, uy=dy*invd, uz=dz*invd;
         const sign=h.sign;
-        // Local corkscrew around the hand, opposite chirality per hand.
-        accx += (-uz)*q*(2.3*sign);
-        accz += ( ux)*q*(2.3*sign);
-        accy += Math.sin((seeds[i]+timeSec)*6.0)*q*.35;
-        // The particles visibly inherit hand velocity as a wake.
-        accx += h.vel[0]*q*.62;
-        accy += h.vel[1]*q*.62;
-        accz += h.vel[2]*q*.62;
-        const radial = (h.squeeze*5.5 - h.trigger*4.2)*q;
+        accx += (-uz + uy*.35)*q*(2.55*sign);
+        accy += ( ux*.25 - uz*.20)*q*(1.35*sign);
+        accz += ( ux - uy*.35)*q*(2.55*sign);
+        accx += h.vel[0]*q*.72;
+        accy += h.vel[1]*q*.72;
+        accz += h.vel[2]*q*.72;
+        const radial = (h.squeeze*6.0 - h.trigger*4.8)*q;
         accx += ux*radial; accy += uy*radial; accz += uz*radial;
       }
     }
+    // Persistent controller-created singularities: softened inverse-square
+    // attraction plus an orbital term around the captured controller axis.
+    let captured=false;
+    for(let si=0;si<singularities.length;si++){
+      const s=singularities[si];
+      const sx=s.pos[0]-x, sy=s.pos[1]-y, sz=s.pos[2]-z;
+      const sd=Math.hypot(sx,sy,sz)+1e-5;
+      if(sd<s.core){
+        // The grain crosses the event horizon and is recycled invisibly into
+        // the outer field, creating continuous accretion instead of a pileup.
+        randomizeParticle(i,head.pos,true);
+        captured=true;
+        break;
+      }
+      if(sd<s.radius){
+        const fall=1.0-sd/s.radius;
+        const invd=1.0/sd;
+        const ux=sx*invd, uy=sy*invd, uz=sz*invd;
+        const g=Math.min(22.0,s.strength*fall*fall/(sd*sd+0.12));
+        accx += ux*g; accy += uy*g; accz += uz*g;
+
+        const ax=s.axis[0], ay=s.axis[1], az=s.axis[2];
+        const tx=ay*uz-az*uy, ty=az*ux-ax*uz, tz=ax*uy-ay*ux;
+        const orbital=(2.2*s.chirality)*fall/(0.45+Math.sqrt(sd));
+        accx += tx*orbital; accy += ty*orbital; accz += tz*orbital;
+      }
+    }
+    if(captured) continue;
 
     vx=(vx+accx*dt)*damping;
     vy=(vy+accy*dt)*damping;
@@ -553,9 +714,9 @@ function simulate(dt,timeSec) {
     const spd=Math.hypot(vx,vy,vz);
     if(spd>4.8){ const s=4.8/spd; vx*=s; vy*=s; vz*=s; }
     x+=vx*dt; y+=vy*dt; z+=vz*dt;
-
-    if(Math.hypot(x-cx,(y-cy)*.7,z-cz)>6.8 || y<cy-3.5 || y>cy+4.8){
-      randomizeParticle(i,center);
+    const nd=Math.hypot(x-cx,y-cy,z-cz);
+    if(nd>FIELD_RADIUS){
+      randomizeParticle(i,head.pos,true);
       continue;
     }
     positions[k]=x; positions[k+1]=y; positions[k+2]=z;
@@ -563,7 +724,6 @@ function simulate(dt,timeSec) {
   }
   uploadParticles();
 }
-
 function resize(){
   if(xrSession) return;
   const dpr=Math.min(devicePixelRatio||1, isMobile?1.35:1.65);
@@ -573,33 +733,56 @@ function resize(){
 }
 addEventListener('resize',resize);
 
-function renderScene(vp, timeSec, pixelRatio) {
+function renderScene(vp, timeSec, pixelRatio, cameraPos) {
+  const invVP=new Float32Array(16);
+  mat4Invert(invVP,vp);
+
+  // TRUE VOLUMETRIC PASS: fullscreen per-eye raymarch through procedural
+  // participating media. No beam meshes / transparent cone impostors.
+  gl.disable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA,gl.ONE);
+  gl.useProgram(volumeProgram);
+  gl.uniformMatrix4fv(gl.getUniformLocation(volumeProgram,'uInvVP'),false,invVP);
+  gl.uniform3f(gl.getUniformLocation(volumeProgram,'uCameraPos'),cameraPos[0],cameraPos[1],cameraPos[2]);
+  const lightPos=[head.pos[0]-2.8,head.pos[1]+7.4,head.pos[2]-3.8];
+  const ldx=.22, ldy=-.96, ldz=.18, ll=Math.hypot(ldx,ldy,ldz);
+  gl.uniform3f(gl.getUniformLocation(volumeProgram,'uLightPos'),lightPos[0],lightPos[1],lightPos[2]);
+  gl.uniform3f(gl.getUniformLocation(volumeProgram,'uLightDir'),ldx/ll,ldy/ll,ldz/ll);
+  gl.uniform1f(gl.getUniformLocation(volumeProgram,'uTime'),timeSec);
+  gl.uniform1f(gl.getUniformLocation(volumeProgram,'uFar'),isMobile?14.0:18.0);
+  gl.uniform1i(gl.getUniformLocation(volumeProgram,'uSteps'),isMobile?16:24);
+  gl.bindVertexArray(null);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  // Shader-rendered singularity cores/accretion disks.
+  if(singularityDirty) uploadSingularities();
+  if(singularities.length){
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(singularityProgram);
+    gl.uniformMatrix4fv(gl.getUniformLocation(singularityProgram,'uVP'),false,vp);
+    gl.uniform1f(gl.getUniformLocation(singularityProgram,'uPixelRatio'),pixelRatio);
+    gl.uniform1f(gl.getUniformLocation(singularityProgram,'uTime'),timeSec);
+    gl.bindVertexArray(singularityVAO);
+    gl.drawArrays(gl.POINTS,0,singularities.length);
+  }
+
   gl.enable(gl.DEPTH_TEST);
   gl.depthFunc(gl.LEQUAL);
   gl.depthMask(false);
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
 
-  gl.useProgram(beamProgram);
-  gl.uniformMatrix4fv(gl.getUniformLocation(beamProgram,'uVP'),false,vp);
-  gl.uniform3f(gl.getUniformLocation(beamProgram,'uCenter'),center[0],center[1]-.2,center[2]);
-  gl.uniform1f(gl.getUniformLocation(beamProgram,'uTime'),timeSec);
-  gl.bindVertexArray(beamVAO);
-  gl.drawArrays(gl.TRIANGLES,0,beamData.length/4);
-
-  const haloPos = new Float32Array([center[0],center[1]+4.35,center[2]]);
-  gl.bindBuffer(gl.ARRAY_BUFFER,haloBuffer);
-  gl.bufferSubData(gl.ARRAY_BUFFER,0,haloPos);
-  gl.useProgram(haloProgram);
-  gl.uniformMatrix4fv(gl.getUniformLocation(haloProgram,'uVP'),false,vp);
-  gl.uniform1f(gl.getUniformLocation(haloProgram,'uSize'),190*pixelRatio);
-  gl.bindVertexArray(haloVAO);
-  gl.drawArrays(gl.POINTS,0,1);
-
   gl.useProgram(particleProgram);
   gl.uniformMatrix4fv(gl.getUniformLocation(particleProgram,'uVP'),false,vp);
+  gl.uniform3f(gl.getUniformLocation(particleProgram,'uCameraPos'),cameraPos[0],cameraPos[1],cameraPos[2]);
   gl.uniform1f(gl.getUniformLocation(particleProgram,'uPixelRatio'),pixelRatio);
   gl.uniform1f(gl.getUniformLocation(particleProgram,'uTime'),timeSec);
+  gl.uniform1f(gl.getUniformLocation(particleProgram,'uFadeStart'),FIELD_FADE_START);
+  gl.uniform1f(gl.getUniformLocation(particleProgram,'uFadeEnd'),FIELD_RADIUS);
   gl.bindVertexArray(pVAO);
   gl.drawArrays(gl.POINTS,0,particleCount);
 
@@ -632,11 +815,12 @@ function desktopFrame(t){
   gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
 
   const eye=[0,1.62,3.7];
+  head.pos[0]=eye[0]; head.pos[1]=eye[1]; head.pos[2]=eye[2];
   const target=[eye[0]+head.forward[0]*3, eye[1]+head.forward[1]*3, eye[2]+head.forward[2]*3];
   lookAt(mView,eye,target,[0,1,0]);
   perspective(mProj,Math.PI/3,canvas.width/canvas.height,.04,40);
   mat4Multiply(mVP,mProj,mView);
-  renderScene(mVP,t/1000,Math.min(devicePixelRatio||1,1.6));
+  renderScene(mVP,t/1000,Math.min(devicePixelRatio||1,1.6),eye);
   updateFPS(t);
 }
 
@@ -652,7 +836,7 @@ async function checkXR(){
   }catch(e){ xrSupported=false; }
   if(xrSupported){
     vrBtn.disabled=false;
-    statusEl.textContent='WebXR ready. Enter VR for 6DoF head, controller, and hand-reactive grains.';
+    statusEl.textContent='WebXR ready. Ray-marched volumetrics active. Trigger attracts, squeeze repels, thumbstick press forms a persistent singularity.';
   }else{
     statusEl.textContent='This browser reports no immersive-vr device. Interactive preview remains available.';
   }
@@ -716,13 +900,10 @@ function xrFrame(t,frame){
   head.vel[2]=(head.pos[2]-head.prevPos[2])*inv;
   updateHeadVectors();
 
-  // Follow the user's physical position while keeping the vortex centered below the head.
-  center[0] += (head.pos[0]-center[0]) * Math.min(1,dt*4.5);
-  center[1] += ((head.pos[1]-.18)-center[1]) * Math.min(1,dt*3.0);
-  center[2] += (head.pos[2]-center[2]) * Math.min(1,dt*4.5);
-
+  // Initialize the endless grain volume around the first tracked headset pose.
   if(xrFirstPose){
-    resetField(center);
+    center[0]=head.pos[0]; center[1]=head.pos[1]; center[2]=head.pos[2];
+    resetField(head.pos);
     xrFirstPose=false;
   }
   updateXRInput(frame,dt);
@@ -738,7 +919,8 @@ function xrFrame(t,frame){
     mView.set(view.transform.inverse.matrix);
     mProj.set(view.projectionMatrix);
     mat4Multiply(mVP,mProj,mView);
-    renderScene(mVP,t/1000,1.0);
+    const ep=view.transform.position;
+    renderScene(mVP,t/1000,1.0,[ep.x,ep.y,ep.z]);
   }
   updateFPS(t);
 }
@@ -753,7 +935,7 @@ fsBtn.addEventListener('click',async()=>{
     else await document.exitFullscreen();
   }catch(e){}
 });
-resetBtn.addEventListener('click',()=>resetField(center));
+resetBtn.addEventListener('click',()=>{ singularities.length=0; singularityDirty=true; resetField(head.pos); });
 
 canvas.addEventListener('pointerdown',e=>{
   pointerDown=true; lastPointerX=e.clientX; lastPointerY=e.clientY;
